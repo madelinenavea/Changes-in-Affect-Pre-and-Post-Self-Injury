@@ -1,0 +1,677 @@
+---
+title: "Affect trajectories"
+author: "Jannah R. Moussaoui & Madeline M. Navea"
+date: "2025-03-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(magrittr)
+library(lme4)
+library(emmeans)
+library(viridis)
+library(plotly)
+```
+
+```{r prepare_data}
+raw_data <- read.csv("Raw data/CompleteDay3Up.csv")
+
+# Subset the data
+data_prep <- raw_data %>% 
+  dplyr::select(
+    PersonID, studydays, SessionTime,
+    Distress, Excited, Upset, Inspired, Nervous,                                                
+    Determined, Scared, Afraid, Enthusiast, Alert,                                              
+    SIB_Binge, SIB_Vomit, SIB_Laxative, SIB_Exercise, 
+    SIB_Fast, SIB_Restrict, SIB_NSSI, SIB_Cut) %>% 
+    dplyr::rename(day_number = studydays) %>% 
+    mutate_all(~ ifelse(. == -999, NA, .),
+             ~ ifelse(. == "NaN", NA, .)) 
+  
+# Converting SIB duration from H:M:S format to minutes
+data_prep %<>%
+  mutate(
+      SIB_engagement = rowSums(
+        dplyr::select(., c(SIB_Binge, SIB_Vomit, SIB_Laxative, SIB_Exercise,SIB_Fast, SIB_Restrict, SIB_NSSI)), na.rm = TRUE),
+      NSSI_engagement = rowSums(
+        dplyr::select(., c(SIB_NSSI, SIB_Cut)), na.rm = TRUE),
+      ED_engagement = rowSums(
+        dplyr::select(., c(SIB_Vomit, SIB_Laxative, SIB_Exercise,SIB_Fast, SIB_Restrict)), na.rm = TRUE),
+      Binge_engagement = rowSums(
+        dplyr::select(., c(SIB_Binge)), na.rm = TRUE))
+
+# Create some meta data
+# We can use the SessionTime variable to count off observations
+# Convert SessionTime to a POSIXct object
+data_prep$SessionTime <- as.POSIXct(data_prep$SessionTime, format = "%m/%d/%y %H:%M")
+ 
+# Group by ID and count the number of session times
+data_prep %<>%
+  arrange(PersonID, day_number, SessionTime) %>%   # Arrange data for counting
+  group_by(PersonID) %>%                           # Group by ID_MOMENT and day number
+  mutate(observation_number = row_number())        # Count observations within each group
+ 
+# Calculate maximum day and observation number for each ID_MOMENT
+max_num <- data_prep %>%
+  group_by(PersonID) %>%
+  summarise(day_total = max(day_number, na.rm = TRUE),
+            observation_total = max(observation_number, na.rm = TRUE))
+
+# Join day_total
+data_prep %<>%
+  left_join(max_num, by = "PersonID")
+
+data_prep %<>%
+  mutate(
+    SIB_engagement_binary = ifelse(SIB_engagement > 0, 1, 0),
+    NSSI_engagement_binary = ifelse(NSSI_engagement > 0, 1, 0),
+    ED_engagement_binary = ifelse(ED_engagement > 0, 1, 0),
+    Binge_engagement_binary = ifelse(Binge_engagement > 0, 1, 0),
+    p_affect = rowMeans(cbind(Excited, Inspired, Determined, Enthusiast, Alert)),
+    n_affect = rowMeans(cbind(Upset, Distress, Nervous, Scared, Afraid)))
+
+data_prep %<>% 
+  dplyr::select(
+    PersonID, observation_number, observation_total, day_number, day_total, SessionTime, 
+    Distress, Upset, Nervous, Scared, Afraid, n_affect,
+    Excited, Inspired, Determined, Enthusiast, Alert, p_affect,
+    SIB_engagement_binary, NSSI_engagement_binary, ED_engagement_binary, Binge_engagement_binary) 
+
+```
+
+```{r}
+# Now that we've subset the data, let's prepare is for analyses
+
+# 1. Identify the first time someone got a survey, first_rec
+clean_data <- data_prep %>% 
+  group_by(PersonID) %>% 
+  mutate(first_rec = min(SessionTime, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+# 2. Calculate how many hours elapsed since first_rec, hrs_elapsed
+  mutate(
+    hrs_elapsed = as.numeric(difftime(SessionTime, first_rec, units = "hours"))
+    )
+
+# 3. Identify days where any SIB occurred (take advantage of 0 vs. 1 coding)
+# 4. Tag the first and second SIB.
+clean_data %<>%
+  group_by(PersonID, day_number) %>% 
+  mutate(
+    SIB_day = max(SIB_engagement_binary, na.rm = TRUE),
+    FirstSIB = ifelse(cumsum(SIB_engagement_binary == 1) > 0, 1, 0),
+    SecSIB = ifelse(cumsum(SIB_engagement_binary) > 1, 1, 0),
+    NSSI_day = max(NSSI_engagement_binary, na.rm = TRUE),
+    FirstNSSI = ifelse(cumsum(NSSI_engagement_binary == 1) > 0, 1, 0),
+    SecNSSI = ifelse(cumsum(NSSI_engagement_binary) > 1, 1, 0),
+    ED_day = max(ED_engagement_binary, na.rm = TRUE),
+    FirstED = ifelse(cumsum(ED_engagement_binary == 1) > 0, 1, 0),
+    SecED = ifelse(cumsum(ED_engagement_binary) > 1, 1, 0)
+    ) %>% 
+  ungroup()
+
+# 5. Identify when the SIB occurred
+clean_data %<>%
+  mutate(
+    SIB_time = ifelse(SIB_engagement_binary == 1, SessionTime, NA),
+    NSSI_time = ifelse(NSSI_engagement_binary == 1, SessionTime, NA),
+    ED_time = ifelse(ED_engagement_binary == 1, SessionTime, NA)
+  ) %>% 
+# 6. Carry the SIB time down
+  group_by(PersonID, day_number) %>%
+  mutate(
+    SIB_time_min = min(SIB_time, na.rm = TRUE),
+    NSSI_time_min = min(NSSI_time, na.rm = TRUE),
+    ED_time_min = min(ED_time, na.rm = TRUE),
+# 7. Cumulative times
+    SIB_time1 = as.numeric(difftime(SessionTime, SIB_time_min, units = "hours")),
+    NSSI_time1 = as.numeric(difftime(SessionTime, NSSI_time_min, units = "hours")),
+    ED_time1 = as.numeric(difftime(SessionTime, ED_time_min, units = "hours")),
+# 8. Compute quadtraic and cubic times
+    SIB_time2 = SIB_time1^2,
+    SIB_time3 = SIB_time1^3,
+    NSSI_time2 = NSSI_time^2,
+    NSSI_time3 = NSSI_time^3,
+    ED_time2 = ED_time^2,
+    ED_time3 = ED_time^3,
+# 9. Replace Inf and -Inf values with NA
+    across(everything(), ~ ifelse(is.infinite(.), NA, .))
+    ) %>%
+# 10. Ungroup to return to regular data frame
+  ungroup()
+
+# Filter down to first SIB of the day
+analytic_data <- clean_data %>% 
+  filter(SIB_day == 1, SecSIB == 0)
+
+analytic_data2 <- clean_data %>% 
+  filter(NSSI_day == 1, SecNSSI == 0)
+
+```
+
+```{r negative_affect}
+####
+# COMPOSITE NA
+####
+
+model_NA <- lmer(n_affect ~ 
+                   SIB_time1 + SIB_time2 + # SIB_time3 +
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_NA <- summary(model_NA)
+# Coefficients
+coefficients_NA <- as.data.frame(summary_model_NA$coefficients) %>% 
+  mutate(Outcome = "Composite")
+
+# Estimates
+estimates_NA <- data.frame(
+  Predictor = rownames(coefficients_NA),
+  Estimate = coefficients_NA$Estimate,
+  Outcome = coefficients_NA$Outcome)
+
+
+####
+# DISTRESS
+####
+
+model_Distress <- lmer(Distress ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Distress <- summary(model_Distress)
+# Coefficients
+coefficients_Distress <- as.data.frame(summary_model_Distress$coefficients) %>% 
+  mutate(Outcome = "Distress")
+
+# Estimates
+estimates_Distress <- data.frame(
+  Predictor = rownames(coefficients_Distress),
+  Estimate = coefficients_Distress$Estimate,
+  Outcome = coefficients_Distress$Outcome)
+
+####
+# Upset
+####
+
+model_Upset <- lmer(Upset ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Upset <- summary(model_Upset)
+# Coefficients
+coefficients_Upset <- as.data.frame(summary_model_Upset$coefficients) %>% 
+  mutate(Outcome = "Upset")
+
+# Estimates
+estimates_Upset <- data.frame(
+  Predictor = rownames(coefficients_Upset),
+  Estimate = coefficients_Upset$Estimate,
+  Outcome = coefficients_Upset$Outcome)
+
+
+
+####
+# Nervous
+####
+
+model_Nervous <- lmer(Nervous ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Nervous <- summary(model_Nervous)
+# Coefficients
+coefficients_Nervous <- as.data.frame(summary_model_Nervous$coefficients) %>% 
+  mutate(Outcome = "Nervous")
+
+# Estimates
+estimates_Nervous <- data.frame(
+  Predictor = rownames(coefficients_Nervous),
+  Estimate = coefficients_Nervous$Estimate,
+  Outcome = coefficients_Nervous$Outcome)
+
+####
+# Scared
+####
+
+model_Scared <- lmer(Scared ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Scared <- summary(model_Scared)
+# Coefficients
+coefficients_Scared <- as.data.frame(summary_model_Scared$coefficients) %>% 
+  mutate(Outcome = "Scared")
+
+# Estimates
+estimates_Scared <- data.frame(
+  Predictor = rownames(coefficients_Scared),
+  Estimate = coefficients_Scared$Estimate,
+  Outcome = coefficients_Scared$Outcome)
+
+
+####
+# Afraid
+####
+
+model_Afraid <- lmer(Afraid ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Afraid <- summary(model_Afraid)
+# Coefficients
+coefficients_Afraid <- as.data.frame(summary_model_Afraid$coefficients) %>% 
+  mutate(Outcome = "Afraid")
+
+# Estimates
+estimates_Afraid <- data.frame(
+  Predictor = rownames(coefficients_Afraid),
+  Estimate = coefficients_Afraid$Estimate,
+  Outcome = coefficients_Afraid$Outcome)
+
+
+# Merge coefficients
+table1_coefficients_NA <- rbind(coefficients_NA, coefficients_Afraid, coefficients_Distress, coefficients_Nervous, coefficients_Scared, coefficients_Upset)
+
+table1_coefficients_NA <- table1_coefficients_NA %>%
+  mutate(
+    # Compute 95% CI bounds
+    CI_lower = Estimate - 1.96 * `Std. Error`,
+    CI_upper = Estimate + 1.96 * `Std. Error`,
+    
+    # Compute p-values from t-statistics
+    p_value = 2 * (1 - pnorm(abs(`t value`))),
+    
+    # Add significance asterisks
+    sig = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      p_value < 0.1   ~ ".",
+      TRUE ~ ""
+    ),
+    
+    # Create a single formatted CI column
+    `95% CI` = paste0("[", 
+                      round(CI_lower, 3), ", ", 
+                      round(CI_upper, 3), "]")
+  ) %>%
+  # (Optional) reorder or select relevant columns
+  select(Outcome, Estimate, `95% CI`,sig)
+
+write.csv(table1_coefficients_NA, "Manuscript/table1.csv", row.names = TRUE)
+
+
+# Construct dataframe for plotting
+time_increment <- tibble(
+  x_time = seq(-4, 4, by = 0.02),
+  event_yn = ifelse(1:401 <= 201, 0, 1)
+  )
+
+
+# List of estimate data and corresponding names
+estimate_list_NA <- list(
+  NegA = estimates_NA,
+  Afraid = estimates_Afraid,
+  Distress = estimates_Distress,
+  Nervous = estimates_Nervous,
+  Scared = estimates_Scared,
+  Upset = estimates_Upset
+)
+
+# Function to compute wide dataframe with y
+compute_wide <- function(estimates, name) {
+  estimates_wide <- estimates %>%
+    pivot_wider(names_from = Predictor, values_from = Estimate) %>%
+    slice(rep(1, 401))
+  
+  bind_cols(time_increment, estimates_wide) %>%
+    mutate(
+      y = `(Intercept)` + 
+          (SIB_time1 * x_time) +
+          (SIB_time2 * x_time^2) + 
+          (`SIB_time1:FirstSIB` * x_time * event_yn) +
+          (`SIB_time2:FirstSIB` * x_time^2 * event_yn),
+      group = name
+    )
+}
+
+# Apply function across all estimates and combine
+graph_NA <- map2_dfr(estimate_list_NA, names(estimate_list_NA), compute_wide)
+
+# Graph
+plot_n <- ggplot(graph_NA, aes(x = x_time, y = y, color = Outcome, linetype = Outcome)) +
+  geom_line(size = 1.2) +  
+  geom_vline(xintercept = 0, color = "black", size = 1) +  
+  theme_classic() +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),  
+    panel.background = element_rect(fill = "white", color = NA),
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 16),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  ) +
+  labs(
+    x = "Time relative to SIB",
+    y = "Negative Affect",
+    color = "Outcome",
+    linetype = "Outcome"
+  ) +
+  scale_color_manual(values = c(
+    "Composite" = "#cc79a7",  # Black
+    "Distress" = "#E69F00",  # Orange
+    "Afraid" = "#56B4E9",    # Sky Blue
+    "Nervous" = "#009E73",   # Bluish Green
+    "Upset" = "#0072b2",     # Yellow
+    "Scared" = "#D55E00"     # Vermillion
+  )) +
+  scale_linetype_manual(values = c(
+    "Composite" = "solid",
+    "Distress" = "dashed",
+    "Afraid" = "dotted",
+    "Nervous" = "longdash",
+    "Upset" = "dotdash",
+    "Scared" = "twodash"
+  )) + 
+  ylim(1, 3)
+
+ggsave("Manuscript/Figure1_NA.png", plot = last_plot())
+
+
+
+
+
+# Convert ggplot to interactive plotly widget
+interactive_plot <- ggplotly(plot_n)
+
+# Optionally save to an HTML file
+htmlwidgets::saveWidget(interactive_plot, "interactive_plot2.html")
+
+
+```
+
+
+```{r postiive_affect}
+####
+# COMPOSITE PA
+####
+
+model_PA <- lmer(p_affect ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_PA <- summary(model_PA)
+# Coefficients
+coefficients_PA <- as.data.frame(summary_model_PA$coefficients) %>% 
+  mutate(Outcome = "Composite")
+
+# Estimates
+estimates_PA <- data.frame(
+  Predictor = rownames(coefficients_PA),
+  Estimate = coefficients_PA$Estimate,
+  Outcome = coefficients_PA$Outcome)
+
+
+####
+# Excited
+####
+model_Excited <- lmer(Excited ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Excited <- summary(model_Excited)
+# Coefficients
+coefficients_Excited <- as.data.frame(summary_model_Excited$coefficients) %>% 
+  mutate(Outcome = "Excited")
+
+# Estimates
+estimates_Excited <- data.frame(
+  Predictor = rownames(coefficients_Excited),
+  Estimate = coefficients_Excited$Estimate,
+  Outcome = coefficients_Excited$Outcome)
+
+####
+# INSPIRED
+####
+model_Inspired <- lmer(Inspired ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Inspired <- summary(model_Inspired)
+# Coefficients
+coefficients_Inspired <- as.data.frame(summary_model_Inspired$coefficients) %>% 
+  mutate(Outcome = "Inspired")
+
+# Estimates
+estimates_Inspired <- data.frame(
+  Predictor = rownames(coefficients_Inspired),
+  Estimate = coefficients_Inspired$Estimate,
+  Outcome = coefficients_Inspired$Outcome)
+
+
+####
+# DETERMINED
+####
+model_Determined <- lmer(Determined ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Determined <- summary(model_Determined)
+# Coefficients
+coefficients_Determined <- as.data.frame(summary_model_Determined$coefficients) %>% 
+  mutate(Outcome = "Determined")
+
+# Estimates
+estimates_Determined <- data.frame(
+  Predictor = rownames(coefficients_Determined),
+  Estimate = coefficients_Determined$Estimate,
+  Outcome = coefficients_Determined$Outcome)
+
+####
+# ENTHUSIASTIC
+####
+model_Enthusiast <- lmer(Enthusiast ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Enthusiast <- summary(model_Enthusiast)
+# Coefficients
+coefficients_Enthusiast <- as.data.frame(summary_model_Enthusiast$coefficients) %>% 
+  mutate(Outcome = "Enthusiast")
+
+# Estimates
+estimates_Enthusiast <- data.frame(
+  Predictor = rownames(coefficients_Enthusiast),
+  Estimate = coefficients_Enthusiast$Estimate,
+  Outcome = coefficients_Enthusiast$Outcome)
+
+
+####
+# ALERT
+####
+model_Alert <- lmer(Alert ~ SIB_time1 + SIB_time2 + # SIB_time3 + 
+                   SIB_time1:FirstSIB + SIB_time2:FirstSIB + # SIB_time3:FirstSIB  + 
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_Alert <- summary(model_Alert)
+# Coefficients
+coefficients_Alert <- as.data.frame(summary_model_Alert$coefficients) %>% 
+  mutate(Outcome = "Alert")
+
+# Estimates
+estimates_Alert <- data.frame(
+  Predictor = rownames(coefficients_Alert),
+  Estimate = coefficients_Alert$Estimate,
+  Outcome = coefficients_Alert$Outcome)
+
+
+# List of estimate data and corresponding names
+estimate_list_PA <- list(
+  PosA = estimates_PA,
+  Excited = estimates_Excited,
+  Inspired = estimates_Inspired,
+  Enthusiast = estimates_Enthusiast,
+  Determined = estimates_Determined,
+  Alert = estimates_Alert
+)
+
+# Merge coefficients
+table2_coefficients_PA <- rbind(coefficients_PA, coefficients_Excited, coefficients_Inspired, coefficients_Enthusiast, coefficients_Determined, coefficients_Alert)
+
+table2_coefficients_PA <- table2_coefficients_PA %>%
+  mutate(
+    # Compute 95% CI bounds
+    CI_lower = Estimate - 1.96 * `Std. Error`,
+    CI_upper = Estimate + 1.96 * `Std. Error`,
+    
+    # Compute p-values from t-statistics
+    p_value = 2 * (1 - pnorm(abs(`t value`))),
+    
+    # Add significance asterisks
+    sig = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      p_value < 0.1   ~ ".",
+      TRUE ~ ""
+    ),
+    
+    # Create a single formatted CI column
+    `95% CI` = paste0("[", 
+                      round(CI_lower, 3), ", ", 
+                      round(CI_upper, 3), "]")
+  ) %>%
+  # (Optional) reorder or select relevant columns
+  select(Outcome, Estimate, `95% CI`,sig)
+
+
+write.csv(table2_coefficients_PA, "Manuscript/table2.csv", row.names = TRUE)
+
+
+
+# Apply function across all estimates and combine
+graph_PA <- map2_dfr(estimate_list_PA, names(estimate_list_PA), compute_wide)
+
+# Graph
+plot_p <- ggplot(graph_PA, aes(x = x_time, y = y, color = Outcome, linetype = Outcome)) +
+  geom_line(size = 1.2) +  
+  geom_vline(xintercept = 0, color = "black", size = 1) +  
+  theme_classic() +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),  
+    panel.background = element_rect(fill = "white", color = NA),
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 16),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  ) +
+  labs(
+    x = "Time relative to SIB",
+    y = "Positive Affect",
+    color = "Outcome",
+    linetype = "Outcome"
+  ) +
+  scale_color_manual(values = c(
+    "Composite" = "#cc79a7",  # Black
+    "Determined" = "#E69F00",  # Orange
+    "Alert" = "#56B4E9",    # Sky Blue
+    "Excited" = "#009E73",   # Bluish Green
+    "Inspired" = "#0072b2",     # Yellow
+    "Enthusiast" = "#D55E00"     # Vermillion
+  )) +
+  scale_linetype_manual(values = c(
+    "Composite" = "solid",
+    "Determined" = "dashed",
+    "Alert" = "dotted",
+    "Excited" = "longdash",
+    "Inspired" = "dotdash",
+    "Ethnusiast" = "twodash"
+  )) + 
+  ylim(1, 3)
+
+
+ggsave("Manuscript/Figure2_PA.png", plot = last_plot())
+
+
+# Convert ggplot to interactive plotly widget
+interactive_plot <- ggplotly(plot_p)
+
+# Optionally save to an HTML file
+htmlwidgets::saveWidget(interactive_plot, "interactive_plot.html")
+
+
+
+```
+
+```{r NA_moderation}
+
+####
+# COMPOSITE NA
+####
+
+model_NA_mod <- lmer(
+  n_affect ~ 
+    SIB_time1 + 
+    SIB_time2 + 
+    SIB_time3 + 
+    SIB_time1 * FirstSIB + 
+    SIB_time2 * FirstSIB + 
+    SIB_time3 * FirstSIB +
+    NSSI_engagement_binary * SIB_time1 + 
+    NSSI_engagement_binary * SIB_time2 + 
+    NSSI_engagement_binary * SIB_time3 + 
+    NSSI_engagement_binary * SIB_time1 * FirstSIB + 
+    NSSI_engagement_binary * SIB_time2 * FirstSIB + 
+    NSSI_engagement_binary * SIB_time3 * FirstSIB +
+    
+                    (1 | PersonID) + (1 | hrs_elapsed), 
+                  data = analytic_data, REML = TRUE)
+
+# Summary
+summary_model_NA_mod <- summary(model_NA_mod)
+# Coefficients
+coefficients_NA <- as.data.frame(summary_model_NA$coefficients) %>% 
+  mutate(Outcome = "Composite")
+
+# Estimates
+estimates_NA <- data.frame(
+  Predictor = rownames(coefficients_NA),
+  Estimate = coefficients_NA$Estimate,
+  Outcome = coefficients_NA$Outcome)
+
+
+```
+
+
+
+```{r demographics}
+demos <- raw_data %>% 
+  select(PersonID, ID, Age, Gen, Gen_4_TEXT, Male, Ethnicity, starts_with("Race")) %>% 
+  unique()
+```
+
